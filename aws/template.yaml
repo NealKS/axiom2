@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Axiom access-risk report pipeline; SAM chosen for concise S3-to-Lambda wiring.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    purpose: S3-triggered Axiom access-risk analysis with reports and aggregate alerts.
+    region: The selected deployment Region; keep all regional resources together.
+    data: Input and report buckets may contain security-review evidence; encryption and private access are required.
+    deployment: Deploy with SAM or CloudFormation after validating the transformed template.
+Parameters:
+  EnableBedrock:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  BedrockModelId:
+    Type: String
+    Default: ''
+  GuardrailId:
+    Type: String
+    Default: ''
+  EnableObjectLock:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+    Description: Optional S3 Object Lock enablement. It must be set at bucket creation; retention configuration is a separate operator decision.
+Conditions:
+  UseBedrock: !Equals [!Ref EnableBedrock, 'true']
+  UseObjectLock: !Equals [!Ref EnableObjectLock, 'true']
+Resources:
+  InputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-input-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      VersioningConfiguration: {Status: Enabled}
+      ObjectLockEnabled: !If [UseObjectLock, true, false]
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-reports-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+      BucketEncryption: {ServerSideEncryptionConfiguration: [{ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}}]}
+      VersioningConfiguration: {Status: Enabled}
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+  InputBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InputBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt InputBucket.Arn, !Sub '${InputBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  ReportsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ReportsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource: [!GetAtt ReportsBucket.Arn, !Sub '${ReportsBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  AccessRiskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: {LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-access-risk', RetentionInDays: 30}
+  AccessRiskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}]
+      Policies:
+        - PolicyName: AccessRiskLeastPrivilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AWS::StackName}-input-${AWS::AccountId}-${AWS::Region}/*'
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${AWS::StackName}-reports-${AWS::AccountId}-${AWS::Region}/*'
+              - Effect: Allow
+                Action: [sns:Publish]
+                Resource: !Ref AlertTopic
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${AccessRiskLogGroup.Arn}:*'
+              - !If
+                - UseBedrock
+                - {Effect: Allow, Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream], Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'}
+                - !Ref AWS::NoValue
+  AccessRiskFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../
+      Handler: aws.lambda_handler.handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt AccessRiskRole.Arn
+      LoggingConfig:
+        LogFormat: Text
+        LogGroup: !Ref AccessRiskLogGroup
+      Environment:
+        Variables:
+          PYTHONPATH: src
+          REPORTS_BUCKET: !Ref ReportsBucket
+          ALERTS_TOPIC: !Ref AlertTopic
+          ENABLE_BEDROCK: !Ref EnableBedrock
+          GUARDIAN_BEDROCK_MODEL_ID: !Ref BedrockModelId
+          GUARDIAN_BEDROCK_GUARDRAIL_ID: !Ref GuardrailId
+      Events:
+        InputCreated:
+          Type: S3
+          Properties:
+            Bucket: !Ref InputBucket
+            Events: s3:ObjectCreated:*
+            Filter: {S3Key: {Rules: [{Name: suffix, Value: '.json'}]}}
+Outputs:
+  InputBucketName: {Value: !Ref InputBucket}
+  ReportsBucketName: {Value: !Ref ReportsBucket}
+  AlertTopicArn: {Value: !Ref AlertTopic}

@@ -1,0 +1,5 @@
+Axiom includes access-risk components derived from Vyper Guard, an MIT-licensed project.
+The original MIT license and copyright notice are preserved in LICENSE.
+
+The Axiom project adds the standalone package boundary, CLI, AWS integration,
+documentation, and product presentation around those reusable components.
